@@ -1,0 +1,131 @@
+name: Android FPS from ZIP
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - MindustryFPS167-browser-upload.zip
+      - .github/workflows/android-from-zip.yml
+      - src/**
+      - tools/**
+      - build.gradle
+      - settings.gradle
+      - mod.json
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fps-android-main
+  cancel-in-progress: true
+
+jobs:
+  android:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Import project without modifying workflow files
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile
+          import hashlib
+          archive = Path('MindustryFPS167-browser-upload.zip')
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          marker = Path('.fps-import.sha256')
+          if not marker.exists() or marker.read_text().strip() != digest:
+              top = {'.gitignore', 'README.md', 'DEVELOPMENT.md', 'PHONE-UPLOAD.md', 'VALIDATION.json', 'build.gradle', 'settings.gradle', 'mod.json'}
+              with ZipFile(archive) as z:
+                  for info in z.infolist():
+                      p = PurePosixPath(info.filename)
+                      if p.is_absolute() or '..' in p.parts:
+                          raise ValueError('Unsafe archive path')
+                      if info.is_dir() or len(p.parts) < 2 or p.parts[0] != 'MindustryFPS167':
+                          continue
+                      relative = PurePosixPath(*p.parts[1:])
+                      if str(relative) not in top and relative.parts[0] not in {'src', 'tools'}:
+                          continue
+                      target = Path(*relative.parts)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(z.read(info))
+              marker.write_text(digest + '\n')
+              print('Project imported; workflow and Codespaces configuration preserved.')
+          else:
+              print('ZIP unchanged; existing source edits preserved.')
+          if not Path('src/fps3d/FpsMod.java').is_file():
+              raise FileNotFoundError('FPS Java sources missing')
+          print('ZIP SHA256:', digest)
+          PY
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a
+        with:
+          gradle-version: '8.14.3'
+      - name: Ensure Android SDK library
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35"'
+      - name: Compile Java, run D8 and verify Android JAR
+        run: gradle --no-daemon --console=plain clean verifyMod
+      - name: Check real 3D geometry
+        run: |
+          javac --release 8 -d build/geometry-check src/fps3d/Geometry.java tools/GeometryCheck.java
+          java -cp build/geometry-check fps3d.GeometryCheck
+      - name: Record successful checks and save source files
+        id: source
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads(Path('VALIDATION.json').read_text())
+          report.update(full_mod_compilation='passed', d8_execution='passed', github_upload='passed', android_runtime='not_tested', installable_jar_created=True, blockers=[])
+          report['validated_in_run'] = os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID']
+          report['github_actions'] = 'compile, dex, package and geometry steps passed; publication still pending'
+          Path('VALIDATION.json').write_text(json.dumps(report, indent=2) + '\n')
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- .fps-import.sha256 src tools build.gradle settings.gradle mod.json README.md DEVELOPMENT.md PHONE-UPLOAD.md VALIDATION.json .gitignore
+          if ! git diff --cached --quiet; then
+            git commit -m 'Import and validate FPS 3D Android sources'
+            git push origin HEAD:main
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Prepare build evidence
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          sha256sum build/libs/MindustryFPS-3D.jar > build/libs/SHA256SUMS.txt
+          {
+            echo "Source commit: $SOURCE_SHA"
+            echo "Workflow commit: $GITHUB_SHA"
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo 'API: official Mindustry v160.7; Java 8 + D8; Android min API 21'
+            echo 'Java compilation, D8, package integrity and geometry checks passed.'
+            echo 'Android gameplay and GPU performance still require device testing.'
+          } > build/libs/BUILD-INFO.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Android-mod-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/libs/MindustryFPS-3D.jar
+            build/libs/SHA256SUMS.txt
+            build/libs/BUILD-INFO.txt
+          if-no-files-found: error
+      - name: Publish JAR for downloading on Android
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          tag="fps-android-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp build/libs/BUILD-INFO.txt release-notes.md
+          gh release create "$tag" build/libs/MindustryFPS-3D.jar build/libs/SHA256SUMS.txt build/libs/BUILD-INFO.txt --target "$SOURCE_SHA" --prerelease --title 'FPS 3D prototype for Mindustry 160.7' --notes-file release-notes.md
+          
